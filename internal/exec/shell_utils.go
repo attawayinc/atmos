@@ -1,26 +1,68 @@
 package exec
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 
+	"mvdan.cc/sh/v3/expand"
+	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
+
+	"github.com/cloudposse/atmos/pkg/schema"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
 // ExecuteShellCommand prints and executes the provided command with args and flags
-func ExecuteShellCommand(command string, args []string, dir string, env []string, dryRun bool) error {
+func ExecuteShellCommand(
+	cliConfig schema.CliConfiguration,
+	command string,
+	args []string,
+	dir string,
+	env []string,
+	dryRun bool,
+	redirectStdError string,
+) error {
 	cmd := exec.Command(command, args...)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Dir = dir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	u.PrintInfo("\nExecuting command:")
-	fmt.Println(cmd.String())
+	if runtime.GOOS == "windows" && redirectStdError == "/dev/null" {
+		redirectStdError = "NUL"
+	}
+
+	if redirectStdError == "/dev/stderr" {
+		cmd.Stderr = os.Stderr
+	} else if redirectStdError == "/dev/stdout" {
+		cmd.Stderr = os.Stdout
+	} else if redirectStdError == "" {
+		cmd.Stderr = os.Stderr
+	} else {
+		f, err := os.OpenFile(redirectStdError, os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			u.LogWarning(cliConfig, err.Error())
+			return err
+		}
+
+		defer func(f *os.File) {
+			err = f.Close()
+			if err != nil {
+				u.LogWarning(cliConfig, err.Error())
+			}
+		}(f)
+
+		cmd.Stderr = f
+	}
+
+	u.LogDebug(cliConfig, "\nExecuting command:")
+	u.LogDebug(cliConfig, cmd.String())
 
 	if dryRun {
 		return nil
@@ -29,44 +71,75 @@ func ExecuteShellCommand(command string, args []string, dir string, env []string
 	return cmd.Run()
 }
 
-// ExecuteShellCommandAndReturnOutput prints and executes the provided command with args and flags and returns the command output
-func ExecuteShellCommandAndReturnOutput(command string, args []string, dir string, env []string, dryRun bool) (string, error) {
-	cmd := exec.Command(command, args...)
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Dir = dir
-	cmd.Stdin = os.Stdin
-	cmd.Stderr = os.Stderr
+// ExecuteShell runs a shell script
+func ExecuteShell(
+	cliConfig schema.CliConfiguration,
+	command string,
+	name string,
+	dir string,
+	env []string,
+	dryRun bool,
+) error {
+	u.LogDebug(cliConfig, "\nExecuting command:")
+	u.LogDebug(cliConfig, command)
 
-	u.PrintInfo("\nExecuting command:")
-	fmt.Println(cmd.String())
+	if dryRun {
+		return nil
+	}
+
+	return shellRunner(command, name, dir, env, os.Stdout)
+}
+
+// ExecuteShellAndReturnOutput runs a shell script and capture its standard output
+func ExecuteShellAndReturnOutput(
+	cliConfig schema.CliConfiguration,
+	command string,
+	name string,
+	dir string,
+	env []string,
+	dryRun bool,
+) (string, error) {
+	var b bytes.Buffer
+
+	u.LogDebug(cliConfig, "\nExecuting command:")
+	u.LogDebug(cliConfig, command)
 
 	if dryRun {
 		return "", nil
 	}
 
-	output, err := cmd.Output()
+	err := shellRunner(command, name, dir, env, &b)
 	if err != nil {
 		return "", err
 	}
 
-	return string(output), nil
+	return b.String(), nil
 }
 
-// ExecuteShellCommands sequentially executes the provided list of commands
-func ExecuteShellCommands(commands []string, dir string, env []string, dryRun bool) error {
-	for _, command := range commands {
-		args := strings.Fields(command)
-		if len(args) > 0 {
-			if err := ExecuteShellCommand(args[0], args[1:], dir, env, dryRun); err != nil {
-				return err
-			}
-		}
+// shellRunner uses mvdan.cc/sh/v3's parser and interpreter to run a shell script and divert its stdout
+func shellRunner(command string, name string, dir string, env []string, out io.Writer) error {
+	parser, err := syntax.NewParser().Parse(strings.NewReader(command), name)
+	if err != nil {
+		return err
 	}
-	return nil
+
+	environ := append(os.Environ(), env...)
+	listEnviron := expand.ListEnviron(environ...)
+	runner, err := interp.New(
+		interp.Dir(dir),
+		interp.Env(listEnviron),
+		interp.StdIO(os.Stdin, out, os.Stderr),
+	)
+	if err != nil {
+		return err
+	}
+
+	return runner.Run(context.TODO(), parser)
 }
 
 // execTerraformShellCommand executes `terraform shell` command by starting a new interactive shell
 func execTerraformShellCommand(
+	cliConfig schema.CliConfiguration,
 	component string,
 	stack string,
 	componentEnvList []string,
@@ -82,18 +155,15 @@ func execTerraformShellCommand(
 	componentEnvList = append(componentEnvList, fmt.Sprintf("TF_CLI_ARGS_destroy=-var-file=%s", varFile))
 	componentEnvList = append(componentEnvList, fmt.Sprintf("TF_CLI_ARGS_console=-var-file=%s", varFile))
 
-	fmt.Println()
-	u.PrintInfo("Starting a new interactive shell where you can execute all native Terraform commands (type 'exit' to go back)")
-	fmt.Printf("Component: %s\n", component)
-	fmt.Printf("Stack: %s\n", stack)
-	fmt.Printf("Working directory: %s\n", workingDir)
-	fmt.Printf("Terraform workspace: %s\n", workspaceName)
-	fmt.Println()
-	u.PrintInfo("Setting the ENV vars in the shell:\n")
+	u.LogDebug(cliConfig, "\nStarting a new interactive shell where you can execute all native Terraform commands (type 'exit' to go back)")
+	u.LogDebug(cliConfig, fmt.Sprintf("Component: %s\n", component))
+	u.LogDebug(cliConfig, fmt.Sprintf("Stack: %s\n", stack))
+	u.LogDebug(cliConfig, fmt.Sprintf("Working directory: %s\n", workingDir))
+	u.LogDebug(cliConfig, fmt.Sprintf("Terraform workspace: %s\n", workspaceName))
+	u.LogDebug(cliConfig, "\nSetting the ENV vars in the shell:\n")
 	for _, v := range componentEnvList {
-		fmt.Println(v)
+		u.LogDebug(cliConfig, v)
 	}
-	fmt.Println()
 
 	// Transfer stdin, stdout, and stderr to the new process and also set the target directory for the shell to start in
 	pa := os.ProcAttr{
@@ -120,8 +190,7 @@ func execTerraformShellCommand(
 		shellCommand = shellCommand + " -l"
 	}
 
-	u.PrintInfo(fmt.Sprintf("Starting process: %s", shellCommand))
-	fmt.Println()
+	u.LogDebug(cliConfig, fmt.Sprintf("Starting process: %s\n", shellCommand))
 
 	args := strings.Fields(shellCommand)
 
@@ -136,6 +205,6 @@ func execTerraformShellCommand(
 		return err
 	}
 
-	fmt.Printf("Exited shell: %s\n", state.String())
+	u.LogDebug(cliConfig, fmt.Sprintf("Exited shell: %s\n", state.String()))
 	return nil
 }

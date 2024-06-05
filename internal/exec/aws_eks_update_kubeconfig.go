@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
@@ -64,7 +65,7 @@ func ExecuteAwsEksUpdateKubeconfigCommand(cmd *cobra.Command, args []string) err
 		component = args[0]
 	}
 
-	executeAwsEksUpdateKubeconfigContext := cfg.AwsEksUpdateKubeconfigContext{
+	executeAwsEksUpdateKubeconfigContext := schema.AwsEksUpdateKubeconfigContext{
 		Component:   component,
 		Stack:       stack,
 		Profile:     profile,
@@ -82,7 +83,7 @@ func ExecuteAwsEksUpdateKubeconfigCommand(cmd *cobra.Command, args []string) err
 
 // ExecuteAwsEksUpdateKubeconfig executes 'aws eks update-kubeconfig'
 // https://docs.aws.amazon.com/cli/latest/reference/eks/update-kubeconfig.html
-func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext cfg.AwsEksUpdateKubeconfigContext) error {
+func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext schema.AwsEksUpdateKubeconfigContext) error {
 	// AWS profile to authenticate to the cluster
 	profile := kubeconfigContext.Profile
 
@@ -120,8 +121,8 @@ func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext cfg.AwsEksUpdateKubeconfigC
 
 	shellCommandWorkingDir := ""
 
-	var configAndStacksInfo cfg.ConfigAndStacksInfo
-	var cliConfig cfg.CliConfiguration
+	var configAndStacksInfo schema.ConfigAndStacksInfo
+	var cliConfig schema.CliConfiguration
 	var err error
 
 	if !requiredParamsProvided {
@@ -132,7 +133,7 @@ func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext cfg.AwsEksUpdateKubeconfigC
 				return err
 			}
 
-			if len(cliConfig.Stacks.NamePattern) < 1 {
+			if len(GetStackNamePattern(cliConfig)) < 1 {
 				return errors.New("stack name pattern must be provided in 'stacks.name_pattern' CLI config or 'ATMOS_STACKS_NAME_PATTERN' ENV variable")
 			}
 
@@ -141,7 +142,7 @@ func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext cfg.AwsEksUpdateKubeconfigC
 				kubeconfigContext.Tenant,
 				kubeconfigContext.Environment,
 				kubeconfigContext.Stage,
-				cliConfig.Stacks.NamePattern,
+				GetStackNamePattern(cliConfig),
 			)
 			if err != nil {
 				return err
@@ -222,14 +223,14 @@ func ExecuteAwsEksUpdateKubeconfig(kubeconfigContext cfg.AwsEksUpdateKubeconfigC
 		args = append(args, fmt.Sprintf("--region=%s", region))
 	}
 
-	err = ExecuteShellCommand("aws", args, shellCommandWorkingDir, nil, dryRun)
+	err = ExecuteShellCommand(cliConfig, "aws", args, shellCommandWorkingDir, nil, dryRun, "")
 	if err != nil {
 		return err
 	}
 
 	if kubeconfigPath != "" {
 		message := fmt.Sprintf("\n'kubeconfig' has been downloaded to '%s'\nYou can set 'KUBECONFIG' ENV var to use in other scripts\n", kubeconfigPath)
-		u.PrintInfo(message)
+		u.LogDebug(cliConfig, message)
 	}
 
 	return nil

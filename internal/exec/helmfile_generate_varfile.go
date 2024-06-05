@@ -9,8 +9,8 @@ import (
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
-// ExecuteHelmfileGenerateVarfile executes `helmfile generate varfile` command
-func ExecuteHelmfileGenerateVarfile(cmd *cobra.Command, args []string) error {
+// ExecuteHelmfileGenerateVarfileCmd executes `helmfile generate varfile` command
+func ExecuteHelmfileGenerateVarfileCmd(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 {
 		return errors.New("invalid arguments. The command requires one argument `component`")
 	}
@@ -24,14 +24,17 @@ func ExecuteHelmfileGenerateVarfile(cmd *cobra.Command, args []string) error {
 
 	component := args[0]
 
-	var info cfg.ConfigAndStacksInfo
+	info, err := processCommandLineArgs("helmfile", cmd, args, nil)
+	if err != nil {
+		return err
+	}
+
 	info.ComponentFromArg = component
 	info.Stack = stack
 	info.ComponentType = "helmfile"
 
 	cliConfig, err := cfg.InitCliConfig(info, true)
 	if err != nil {
-		u.PrintErrorToStdError(err)
 		return err
 	}
 
@@ -55,15 +58,18 @@ func ExecuteHelmfileGenerateVarfile(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print the component variables
-	u.PrintInfo(fmt.Sprintf("\nVariables for the component '%s' in the stack '%s':\n", info.ComponentFromArg, info.Stack))
-	err = u.PrintAsYAML(info.ComponentVarsSection)
-	if err != nil {
-		return err
+	u.LogDebug(cliConfig, fmt.Sprintf("\nVariables for the component '%s' in the stack '%s':", info.ComponentFromArg, info.Stack))
+
+	if cliConfig.Logs.Level == u.LogLevelTrace || cliConfig.Logs.Level == u.LogLevelDebug {
+		err = u.PrintAsYAMLToFileDescriptor(cliConfig, info.ComponentVarsSection)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Write the variables to file
-	u.PrintInfo("Writing the variables to file:")
-	fmt.Println(varFilePath)
+	u.LogDebug(cliConfig, "Writing the variables to file:")
+	u.LogDebug(cliConfig, varFilePath)
 
 	if !info.DryRun {
 		err = u.WriteToFileAsYAML(varFilePath, info.ComponentVarsSection, 0644)
@@ -72,6 +78,5 @@ func ExecuteHelmfileGenerateVarfile(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Println()
 	return nil
 }

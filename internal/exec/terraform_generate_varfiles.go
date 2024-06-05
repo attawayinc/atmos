@@ -8,14 +8,19 @@ import (
 	"strings"
 
 	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
 // ExecuteTerraformGenerateVarfilesCmd executes `terraform generate varfiles` command
 func ExecuteTerraformGenerateVarfilesCmd(cmd *cobra.Command, args []string) error {
-	cliConfig, err := cfg.InitCliConfig(cfg.ConfigAndStacksInfo{}, true)
+	info, err := processCommandLineArgs("terraform", cmd, args, nil)
 	if err != nil {
-		u.PrintErrorToStdError(err)
+		return err
+	}
+
+	cliConfig, err := cfg.InitCliConfig(info, true)
+	if err != nil {
 		return err
 	}
 
@@ -59,13 +64,11 @@ func ExecuteTerraformGenerateVarfilesCmd(cmd *cobra.Command, args []string) erro
 }
 
 // ExecuteTerraformGenerateVarfiles generates varfiles for all terraform components in all stacks
-func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTemplate string, format string, stacks []string, components []string) error {
-	stacksMap, err := FindStacksMap(cliConfig)
+func ExecuteTerraformGenerateVarfiles(cliConfig schema.CliConfiguration, fileTemplate string, format string, stacks []string, components []string) error {
+	stacksMap, _, err := FindStacksMap(cliConfig, false)
 	if err != nil {
 		return err
 	}
-
-	fmt.Println()
 
 	var ok bool
 	var componentsSection map[string]any
@@ -111,7 +114,7 @@ func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTempla
 				// If `component` attribute is present, it's the terraform component.
 				// Otherwise, the YAML component name is the terraform component.
 				terraformComponent := componentName
-				if componentAttribute, ok := componentSection["component"].(string); ok {
+				if componentAttribute, ok := componentSection[cfg.ComponentSectionName].(string); ok {
 					terraformComponent = componentAttribute
 				}
 
@@ -126,7 +129,7 @@ func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTempla
 				context := cfg.GetContextFromVars(varsSection)
 				context.Component = strings.Replace(componentName, "/", "-", -1)
 				context.ComponentPath = terraformComponentPath
-				contextPrefix, err := cfg.GetContextPrefix(stackFileName, context, cliConfig.Stacks.NamePattern, stackFileName)
+				contextPrefix, err := cfg.GetContextPrefix(stackFileName, context, GetStackNamePattern(cliConfig), stackFileName)
 				if err != nil {
 					return err
 				}
@@ -141,7 +144,7 @@ func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTempla
 					u.SliceContainsString(stacks, contextPrefix) {
 
 					// Replace the tokens in the file template
-					// Supported context tokens: {namespace}, {tenant}, {environment}, {region}, {stage}, {component}, {component-path}
+					// Supported context tokens: {namespace}, {tenant}, {environment}, {region}, {stage}, {base-component}, {component}, {component-path}
 					fileName := cfg.ReplaceContextTokens(context, fileTemplate)
 					fileAbsolutePath, err := filepath.Abs(fileName)
 					if err != nil {
@@ -166,7 +169,7 @@ func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTempla
 							return err
 						}
 					} else if format == "hcl" {
-						err = u.WriteToFileAsHcl(fileAbsolutePath, varsSection, 0644)
+						err = u.WriteToFileAsHcl(cliConfig, fileAbsolutePath, varsSection, 0644)
 						if err != nil {
 							return err
 						}
@@ -174,12 +177,11 @@ func ExecuteTerraformGenerateVarfiles(cliConfig cfg.CliConfiguration, fileTempla
 						return fmt.Errorf("invalid '--format' argument '%s'. Valid values are 'json' (default), 'yaml' and 'hcl", format)
 					}
 
-					u.PrintInfo(fmt.Sprintf("varfile: %s", fileName))
-					u.PrintMessage(fmt.Sprintf("terraform component: %s", terraformComponent))
-					u.PrintMessage(fmt.Sprintf("atmos component: %s", componentName))
-					u.PrintMessage(fmt.Sprintf("atmos stack: %s", contextPrefix))
-					u.PrintMessage(fmt.Sprintf("stack config file: %s", stackFileName))
-					fmt.Println()
+					u.LogDebug(cliConfig, fmt.Sprintf("varfile: %s", fileName))
+					u.LogDebug(cliConfig, fmt.Sprintf("terraform component: %s", terraformComponent))
+					u.LogDebug(cliConfig, fmt.Sprintf("atmos component: %s", componentName))
+					u.LogDebug(cliConfig, fmt.Sprintf("atmos stack: %s", contextPrefix))
+					u.LogDebug(cliConfig, fmt.Sprintf("stack config file: %s", stackFileName))
 				}
 			}
 		}

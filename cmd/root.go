@@ -1,9 +1,19 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
+	"errors"
+	"fmt"
+	"os"
 
+	"github.com/elewis787/boa"
+	cc "github.com/ivanpirog/coloredcobra"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+
+	e "github.com/cloudposse/atmos/internal/exec"
+	tuiUtils "github.com/cloudposse/atmos/internal/tui/utils"
 	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
@@ -11,34 +21,99 @@ import (
 var RootCmd = &cobra.Command{
 	Use:   "atmos",
 	Short: "Universal Tool for DevOps and Cloud Automation",
-	Long:  `'atmos'' is a universal tool for DevOps and cloud automation used for provisioning, managing and orchestrating workflows across various toolchains`,
+	Long:  `Atmos is a universal tool for DevOps and cloud automation used for provisioning, managing and orchestrating workflows across various toolchains`,
+	PreRun: func(cmd *cobra.Command, args []string) {
+	},
+	Run: func(cmd *cobra.Command, args []string) {
+		// Check Atmos configuration
+		checkAtmosConfig()
+
+		// Print a styled Atmos logo to the terminal
+		fmt.Println()
+		err := tuiUtils.PrintStyledText("ATMOS")
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
+
+		err = e.ExecuteAtmosCmd()
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
 // This is called by main.main(). It only needs to happen once to the RootCmd.
 func Execute() error {
-	return RootCmd.Execute()
-}
+	cc.Init(&cc.Config{
+		RootCmd:  RootCmd,
+		Headings: cc.HiCyan + cc.Bold + cc.Underline,
+		Commands: cc.HiGreen + cc.Bold,
+		Example:  cc.Italic,
+		ExecName: cc.Bold,
+		Flags:    cc.Bold,
+	})
 
-func init() {
-	cobra.OnInitialize(initConfig)
+	// Check if the `help` flag is passed and print a styled Atmos logo to the terminal before printing the help
+	err := RootCmd.ParseFlags(os.Args)
+	if err != nil && errors.Is(err, pflag.ErrHelp) {
+		fmt.Println()
+		err = tuiUtils.PrintStyledText("ATMOS")
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
+	}
 
 	// InitCliConfig finds and merges CLI configurations in the following order:
 	// system dir, home dir, current dir, ENV vars, command-line arguments
 	// Here we need the custom commands from the config
-	cliConfig, err := cfg.InitCliConfig(cfg.ConfigAndStacksInfo{}, false)
-	if err != nil {
-		u.PrintErrorToStdErrorAndExit(err)
+	cliConfig, err := cfg.InitCliConfig(schema.ConfigAndStacksInfo{}, false)
+	if err != nil && !errors.Is(err, cfg.NotFound) {
+		u.LogErrorAndExit(err)
 	}
 
-	// Add custom commands from the CLI config
-	err = processCustomCommands(cliConfig.Commands, RootCmd, true)
-	if err != nil {
-		u.PrintErrorToStdErrorAndExit(err)
+	// If CLI configuration was found, process its custom commands and command aliases
+	if err == nil {
+		err = processCustomCommands(cliConfig, cliConfig.Commands, RootCmd, true)
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
+
+		err = processCommandAliases(cliConfig, cliConfig.CommandAliases, RootCmd, true)
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
 	}
+
+	return RootCmd.Execute()
+}
+
+func init() {
+	RootCmd.PersistentFlags().String("redirect-stderr", "", "File descriptor to redirect 'stderr' to. "+
+		"Errors can be redirected to any file or any standard file descriptor (including '/dev/null'): atmos <command> --redirect-stderr /dev/stdout")
+
+	RootCmd.PersistentFlags().String("logs-level", "Info", "Logs level. Supported log levels are Trace, Debug, Info, Warning, Off. If the log level is set to Off, Atmos will not log any messages")
+	RootCmd.PersistentFlags().String("logs-file", "/dev/stdout", "The file to write Atmos logs to. Logs can be written to any file or any standard file descriptor, including '/dev/stdout', '/dev/stderr' and '/dev/null'")
+
+	cobra.OnInitialize(initConfig)
 }
 
 func initConfig() {
+	styles := boa.DefaultStyles()
+	b := boa.New(boa.WithStyles(styles))
+
+	RootCmd.SetUsageFunc(b.UsageFunc)
+
+	RootCmd.SetHelpFunc(func(command *cobra.Command, strings []string) {
+		// Print a styled Atmos logo to the terminal
+		fmt.Println()
+		err := tuiUtils.PrintStyledText("ATMOS")
+		if err != nil {
+			u.LogErrorAndExit(err)
+		}
+
+		b.HelpFunc(command, strings)
+	})
 }
 
 // https://www.sobyte.net/post/2021-12/create-cli-app-with-cobra/

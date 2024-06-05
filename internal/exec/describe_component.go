@@ -1,18 +1,22 @@
 package exec
 
 import (
-	"fmt"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	cfg "github.com/cloudposse/atmos/pkg/config"
-	u "github.com/cloudposse/atmos/pkg/utils"
+	"github.com/cloudposse/atmos/pkg/schema"
 )
 
-// ExecuteDescribeComponent executes `describe component` command
-func ExecuteDescribeComponent(cmd *cobra.Command, args []string) error {
+// ExecuteDescribeComponentCmd executes `describe component` command
+func ExecuteDescribeComponentCmd(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 {
 		return errors.New("invalid arguments. The command requires one argument `component`")
+	}
+
+	_, err := cfg.InitCliConfig(schema.ConfigAndStacksInfo{}, true)
+	if err != nil {
+		return err
 	}
 
 	flags := cmd.Flags()
@@ -22,34 +26,51 @@ func ExecuteDescribeComponent(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	component := args[0]
-
-	var configAndStacksInfo cfg.ConfigAndStacksInfo
-	configAndStacksInfo.ComponentFromArg = component
-	configAndStacksInfo.Stack = stack
-
-	cliConfig, err := cfg.InitCliConfig(configAndStacksInfo, true)
+	format, err := flags.GetString("format")
 	if err != nil {
-		u.PrintErrorToStdError(err)
 		return err
 	}
 
-	configAndStacksInfo.ComponentType = "terraform"
-	configAndStacksInfo, err = ProcessStacks(cliConfig, configAndStacksInfo, true)
+	file, err := flags.GetString("file")
 	if err != nil {
-		u.PrintErrorVerbose(cliConfig.Logs.Verbose, err)
-		configAndStacksInfo.ComponentType = "helmfile"
-		configAndStacksInfo, err = ProcessStacks(cliConfig, configAndStacksInfo, true)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 
-	fmt.Println()
-	err = u.PrintAsYAML(configAndStacksInfo.ComponentSection)
+	component := args[0]
+
+	componentSection, err := ExecuteDescribeComponent(component, stack)
+	if err != nil {
+		return err
+	}
+
+	err = printOrWriteToFile(format, file, componentSection)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// ExecuteDescribeComponent describes component config
+func ExecuteDescribeComponent(component string, stack string) (map[string]any, error) {
+	var configAndStacksInfo schema.ConfigAndStacksInfo
+	configAndStacksInfo.ComponentFromArg = component
+	configAndStacksInfo.Stack = stack
+
+	cliConfig, err := cfg.InitCliConfig(configAndStacksInfo, true)
+	if err != nil {
+		return nil, err
+	}
+
+	configAndStacksInfo.ComponentType = "terraform"
+	configAndStacksInfo, err = ProcessStacks(cliConfig, configAndStacksInfo, true)
+	if err != nil {
+		configAndStacksInfo.ComponentType = "helmfile"
+		configAndStacksInfo, err = ProcessStacks(cliConfig, configAndStacksInfo, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return configAndStacksInfo.ComponentSection, nil
 }

@@ -10,8 +10,8 @@ import (
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
-// ExecuteTerraformGenerateBackend executes `terraform generate backend` command
-func ExecuteTerraformGenerateBackend(cmd *cobra.Command, args []string) error {
+// ExecuteTerraformGenerateBackendCmd executes `terraform generate backend` command
+func ExecuteTerraformGenerateBackendCmd(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 {
 		return errors.New("invalid arguments. The command requires one argument `component`")
 	}
@@ -25,14 +25,17 @@ func ExecuteTerraformGenerateBackend(cmd *cobra.Command, args []string) error {
 
 	component := args[0]
 
-	var info cfg.ConfigAndStacksInfo
+	info, err := processCommandLineArgs("terraform", cmd, args, nil)
+	if err != nil {
+		return err
+	}
+
 	info.ComponentFromArg = component
 	info.Stack = stack
 	info.ComponentType = "terraform"
 
 	cliConfig, err := cfg.InitCliConfig(info, true)
 	if err != nil {
-		u.PrintErrorToStdError(err)
 		return err
 	}
 
@@ -49,17 +52,25 @@ func ExecuteTerraformGenerateBackend(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("\nCould not find 'backend' config for the '%s' component.\n", component)
 	}
 
-	componentBackendConfig := generateComponentBackendConfig(info.ComponentBackendType, info.ComponentBackendSection)
-
-	u.PrintInfoVerbose(cliConfig.Logs.Verbose, "Component backend config:\n\n")
-	err = u.PrintAsJSON(componentBackendConfig)
+	componentBackendConfig, err := generateComponentBackendConfig(info.ComponentBackendType, info.ComponentBackendSection, info.TerraformWorkspace)
 	if err != nil {
 		return err
 	}
 
-	// Check if the `backend` section has `workspace_key_prefix`
-	if _, ok := info.ComponentBackendSection["workspace_key_prefix"].(string); !ok {
-		return fmt.Errorf("\nBackend config for the '%s' component is missing 'workspace_key_prefix'\n", component)
+	u.LogDebug(cliConfig, "Component backend config:\n\n")
+
+	if cliConfig.Logs.Level == u.LogLevelTrace || cliConfig.Logs.Level == u.LogLevelDebug {
+		err = u.PrintAsJSONToFileDescriptor(cliConfig, componentBackendConfig)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Check if the `backend` section has `workspace_key_prefix` when `backend_type` is `s3`
+	if info.ComponentBackendType == "s3" {
+		if _, ok := info.ComponentBackendSection["workspace_key_prefix"].(string); !ok {
+			return fmt.Errorf("backend config for the '%s' component is missing 'workspace_key_prefix'", component)
+		}
 	}
 
 	// Write backend config to file
@@ -71,9 +82,8 @@ func ExecuteTerraformGenerateBackend(cmd *cobra.Command, args []string) error {
 		"backend.tf.json",
 	)
 
-	fmt.Println()
-	u.PrintInfo("Writing the backend config to file:")
-	u.PrintMessage(backendFilePath)
+	u.LogDebug(cliConfig, "\nWriting the backend config to file:")
+	u.LogDebug(cliConfig, backendFilePath)
 
 	if !info.DryRun {
 		err = u.WriteToFileAsJSON(backendFilePath, componentBackendConfig, 0644)
@@ -82,6 +92,5 @@ func ExecuteTerraformGenerateBackend(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Println()
 	return nil
 }

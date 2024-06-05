@@ -2,11 +2,15 @@ package spacelift
 
 import (
 	"fmt"
-	"github.com/pkg/errors"
+	"sort"
 	"strings"
+
+	"github.com/mitchellh/mapstructure"
+	"github.com/pkg/errors"
 
 	e "github.com/cloudposse/atmos/internal/exec"
 	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
 	s "github.com/cloudposse/atmos/pkg/stack"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
@@ -21,105 +25,82 @@ func CreateSpaceliftStacks(
 	processStackDeps bool,
 	processComponentDeps bool,
 	processImports bool,
-	stackConfigPathTemplate string) (map[string]any, error) {
+	stackConfigPathTemplate string,
+) (map[string]any, error) {
+
+	cliConfig, err := cfg.InitCliConfig(schema.ConfigAndStacksInfo{}, true)
+	if err != nil {
+		u.LogError(err)
+		return nil, err
+	}
 
 	if len(filePaths) > 0 {
-		_, stacks, err := s.ProcessYAMLConfigFiles(
+		_, stacks, rawStackConfigs, err := s.ProcessYAMLConfigFiles(
+			cliConfig,
 			stacksBasePath,
 			terraformComponentsBasePath,
 			helmfileComponentsBasePath,
 			filePaths,
 			processStackDeps,
 			processComponentDeps,
+			false,
 		)
 		if err != nil {
-			u.PrintErrorToStdError(err)
+			u.LogError(err)
 			return nil, err
 		}
 
-		return TransformStackConfigToSpaceliftStacks(stacks, stackConfigPathTemplate, "", processImports)
+		return TransformStackConfigToSpaceliftStacks(
+			cliConfig,
+			stacks,
+			stackConfigPathTemplate,
+			"",
+			processImports,
+			rawStackConfigs,
+		)
 	} else {
-		cliConfig, err := cfg.InitCliConfig(cfg.ConfigAndStacksInfo{}, true)
-		if err != nil {
-			u.PrintErrorToStdError(err)
-			return nil, err
-		}
-
-		_, stacks, err := s.ProcessYAMLConfigFiles(
+		_, stacks, rawStackConfigs, err := s.ProcessYAMLConfigFiles(
+			cliConfig,
 			cliConfig.StacksBaseAbsolutePath,
 			cliConfig.TerraformDirAbsolutePath,
 			cliConfig.HelmfileDirAbsolutePath,
 			cliConfig.StackConfigFilesAbsolutePaths,
 			processStackDeps,
 			processComponentDeps,
+			false,
 		)
 		if err != nil {
-			u.PrintErrorToStdError(err)
+			u.LogError(err)
 			return nil, err
 		}
 
-		return TransformStackConfigToSpaceliftStacks(stacks, stackConfigPathTemplate, cliConfig.Stacks.NamePattern, processImports)
+		return TransformStackConfigToSpaceliftStacks(
+			cliConfig,
+			stacks,
+			stackConfigPathTemplate,
+			e.GetStackNamePattern(cliConfig),
+			processImports,
+			rawStackConfigs,
+		)
 	}
 }
 
-// TransformStackConfigToSpaceliftStacks takes a map of stack configs and transforms it to a map of Spacelift stacks
+// TransformStackConfigToSpaceliftStacks takes a map of stack manifests and transforms it to a map of Spacelift stacks
 func TransformStackConfigToSpaceliftStacks(
+	cliConfig schema.CliConfiguration,
 	stacks map[string]any,
 	stackConfigPathTemplate string,
 	stackNamePattern string,
-	processImports bool) (map[string]any, error) {
+	processImports bool,
+	rawStackConfigs map[string]map[string]any,
+) (map[string]any, error) {
 
 	var err error
 	res := map[string]any{}
-	var allStackNames []string
 
-	for stackName, stackConfig := range stacks {
-		config := stackConfig.(map[any]any)
-
-		if i, ok := config["components"]; ok {
-			componentsSection := i.(map[string]any)
-
-			if terraformComponents, ok := componentsSection["terraform"]; ok {
-				terraformComponentsMap := terraformComponents.(map[string]any)
-
-				for component, v := range terraformComponentsMap {
-					componentMap := v.(map[string]any)
-					componentVars := map[any]any{}
-					spaceliftSettings := map[any]any{}
-
-					if i, ok2 := componentMap["vars"]; ok2 {
-						componentVars = i.(map[any]any)
-					}
-
-					componentSettings := map[any]any{}
-					if i, ok2 := componentMap["settings"]; ok2 {
-						componentSettings = i.(map[any]any)
-					}
-
-					if i, ok2 := componentSettings["spacelift"]; ok2 {
-						spaceliftSettings = i.(map[any]any)
-					}
-
-					context := cfg.GetContextFromVars(componentVars)
-
-					var contextPrefix string
-
-					if stackNamePattern != "" {
-						contextPrefix, err = cfg.GetContextPrefix(stackName, context, stackNamePattern, stackName)
-						if err != nil {
-							u.PrintErrorToStdError(err)
-							return nil, err
-						}
-					} else {
-						contextPrefix = strings.Replace(stackName, "/", "-", -1)
-					}
-
-					context.Component = component
-					spaceliftStackName, _ := buildSpaceliftStackName(spaceliftSettings, context, contextPrefix)
-					allStackNames = append(allStackNames, strings.Replace(spaceliftStackName, "/", "-", -1))
-				}
-			}
-		}
+	allStackNames, err := e.BuildSpaceliftStackNames(stacks, stackNamePattern)
+	if err != nil {
+		return nil, err
 	}
 
 	for stackName, stackConfig := range stacks {
@@ -167,11 +148,6 @@ func TransformStackConfigToSpaceliftStacks(
 						spaceliftExplicitLabels = i.([]any)
 					}
 
-					spaceliftDependsOn := []any{}
-					if i, ok2 := spaceliftSettings["depends_on"]; ok2 {
-						spaceliftDependsOn = i.([]any)
-					}
-
 					spaceliftConfig := map[string]any{}
 					spaceliftConfig["enabled"] = spaceliftWorkspaceEnabled
 
@@ -183,11 +159,6 @@ func TransformStackConfigToSpaceliftStacks(
 					componentEnv := map[any]any{}
 					if i, ok2 := componentMap["env"]; ok2 {
 						componentEnv = i.(map[any]any)
-					}
-
-					componentDeps := []string{}
-					if i, ok2 := componentMap["deps"]; ok2 {
-						componentDeps = i.([]string)
 					}
 
 					componentStacks := []string{}
@@ -216,24 +187,23 @@ func TransformStackConfigToSpaceliftStacks(
 					if stackNamePattern != "" {
 						contextPrefix, err = cfg.GetContextPrefix(stackName, context, stackNamePattern, stackName)
 						if err != nil {
-							u.PrintErrorToStdError(err)
+							u.LogError(err)
 							return nil, err
 						}
 					} else {
 						contextPrefix = strings.Replace(stackName, "/", "-", -1)
 					}
 
-					spaceliftConfig["component"] = component
+					spaceliftConfig[cfg.ComponentSectionName] = component
 					spaceliftConfig["stack"] = contextPrefix
 					spaceliftConfig["imports"] = imports
-					spaceliftConfig["vars"] = componentVars
-					spaceliftConfig["settings"] = componentSettings
-					spaceliftConfig["env"] = componentEnv
-					spaceliftConfig["deps"] = componentDeps
+					spaceliftConfig[cfg.VarsSectionName] = componentVars
+					spaceliftConfig[cfg.SettingsSectionName] = componentSettings
+					spaceliftConfig[cfg.EnvSectionName] = componentEnv
 					spaceliftConfig["stacks"] = componentStacks
 					spaceliftConfig["inheritance"] = componentInheritance
 					spaceliftConfig["base_component"] = baseComponentName
-					spaceliftConfig["metadata"] = componentMetadata
+					spaceliftConfig[cfg.MetadataSectionName] = componentMetadata
 
 					// backend
 					backendTypeName := ""
@@ -248,15 +218,46 @@ func TransformStackConfigToSpaceliftStacks(
 					}
 					spaceliftConfig["backend"] = componentBackend
 
-					// Terraform workspace
-					workspace, err := e.BuildTerraformWorkspace(
-						stackName,
-						stackNamePattern,
-						componentMetadata,
-						context,
-					)
+					configAndStacksInfo := schema.ConfigAndStacksInfo{
+						ComponentFromArg:          component,
+						ComponentType:             "terraform",
+						StackFile:                 stackName,
+						ComponentVarsSection:      componentVars,
+						ComponentEnvSection:       componentEnv,
+						ComponentSettingsSection:  componentSettings,
+						ComponentMetadataSection:  componentMetadata,
+						ComponentBackendSection:   componentBackend,
+						ComponentBackendType:      backendTypeName,
+						ComponentInheritanceChain: componentInheritance,
+						Context:                   context,
+						ComponentSection: map[string]any{
+							cfg.VarsSectionName:        componentVars,
+							cfg.EnvSectionName:         componentEnv,
+							cfg.SettingsSectionName:    componentSettings,
+							cfg.MetadataSectionName:    componentMetadata,
+							cfg.BackendSectionName:     componentBackend,
+							cfg.BackendTypeSectionName: backendTypeName,
+						},
+					}
+
+					// Component dependencies
+					sources, err := e.ProcessConfigSources(configAndStacksInfo, rawStackConfigs)
 					if err != nil {
-						u.PrintErrorToStdError(err)
+						return nil, err
+					}
+
+					componentDeps, componentDepsAll, err := e.FindComponentDependencies(stackName, sources)
+					if err != nil {
+						return nil, err
+					}
+
+					spaceliftConfig["deps"] = componentDeps
+					spaceliftConfig["deps_all"] = componentDepsAll
+
+					// Terraform workspace
+					workspace, err := e.BuildTerraformWorkspace(cliConfig, configAndStacksInfo)
+					if err != nil {
+						u.LogError(err)
 						return nil, err
 					}
 					spaceliftConfig["workspace"] = workspace
@@ -278,31 +279,108 @@ func TransformStackConfigToSpaceliftStacks(
 
 					var terraformComponentNamesInCurrentStack []string
 
-					for v := range terraformComponentsMap {
-						terraformComponentNamesInCurrentStack = append(terraformComponentNamesInCurrentStack, strings.Replace(v, "/", "-", -1))
+					for v2 := range terraformComponentsMap {
+						terraformComponentNamesInCurrentStack = append(terraformComponentNamesInCurrentStack, strings.Replace(v2, "/", "-", -1))
 					}
 
-					for _, v := range spaceliftDependsOn {
-						spaceliftStackNameDependsOn, err := buildSpaceliftDependsOnStackName(
-							v.(string),
+					// Legacy/deprecated `settings.spacelift.depends_on`
+					spaceliftDependsOn := []any{}
+					if i, ok2 := spaceliftSettings["depends_on"]; ok2 {
+						spaceliftDependsOn = i.([]any)
+					}
+
+					var spaceliftStackNameDependsOnLabels1 []string
+
+					for _, dep := range spaceliftDependsOn {
+						spaceliftStackNameDependsOn, err := e.BuildDependentStackNameFromDependsOnLegacy(
+							dep.(string),
 							allStackNames,
 							contextPrefix,
 							terraformComponentNamesInCurrentStack,
-							component)
+							component,
+						)
 						if err != nil {
-							u.PrintErrorToStdError(err)
+							u.LogError(err)
 							return nil, err
 						}
-						labels = append(labels, fmt.Sprintf("depends-on:%s", spaceliftStackNameDependsOn))
+						spaceliftStackNameDependsOnLabels1 = append(spaceliftStackNameDependsOnLabels1, fmt.Sprintf("depends-on:%s", spaceliftStackNameDependsOn))
 					}
 
+					sort.Strings(spaceliftStackNameDependsOnLabels1)
+					labels = append(labels, spaceliftStackNameDependsOnLabels1...)
+
+					// Recommended `settings.depends_on`
+					var stackComponentSettingsDependsOn schema.Settings
+					err = mapstructure.Decode(componentSettings, &stackComponentSettingsDependsOn)
+					if err != nil {
+						return nil, err
+					}
+
+					var spaceliftStackNameDependsOnLabels2 []string
+
+					for _, stackComponentSettingsDependsOnContext := range stackComponentSettingsDependsOn.DependsOn {
+						if stackComponentSettingsDependsOnContext.Component == "" {
+							continue
+						}
+
+						if stackComponentSettingsDependsOnContext.Namespace == "" {
+							stackComponentSettingsDependsOnContext.Namespace = context.Namespace
+						}
+						if stackComponentSettingsDependsOnContext.Tenant == "" {
+							stackComponentSettingsDependsOnContext.Tenant = context.Tenant
+						}
+						if stackComponentSettingsDependsOnContext.Environment == "" {
+							stackComponentSettingsDependsOnContext.Environment = context.Environment
+						}
+						if stackComponentSettingsDependsOnContext.Stage == "" {
+							stackComponentSettingsDependsOnContext.Stage = context.Stage
+						}
+
+						var contextPrefixDependsOn string
+
+						if stackNamePattern != "" {
+							contextPrefixDependsOn, err = cfg.GetContextPrefix(
+								stackName,
+								stackComponentSettingsDependsOnContext,
+								stackNamePattern,
+								stackName,
+							)
+							if err != nil {
+								return nil, err
+							}
+						} else {
+							contextPrefixDependsOn = strings.Replace(stackName, "/", "-", -1)
+						}
+
+						spaceliftStackNameDependsOn, err := e.BuildDependentStackNameFromDependsOn(
+							component,
+							contextPrefix,
+							stackComponentSettingsDependsOnContext.Component,
+							contextPrefixDependsOn,
+							allStackNames,
+						)
+						if err != nil {
+							u.LogError(err)
+							return nil, err
+						}
+						spaceliftStackNameDependsOnLabels2 = append(spaceliftStackNameDependsOnLabels2, fmt.Sprintf("depends-on:%s", spaceliftStackNameDependsOn))
+					}
+
+					sort.Strings(spaceliftStackNameDependsOnLabels2)
+					labels = append(labels, spaceliftStackNameDependsOnLabels2...)
+
+					// Add `component` and `folder` labels
 					labels = append(labels, fmt.Sprintf("folder:component/%s", component))
 					labels = append(labels, fmt.Sprintf("folder:%s", strings.Replace(contextPrefix, "-", "/", -1)))
 
 					spaceliftConfig["labels"] = u.UniqueStrings(labels)
 
 					// Spacelift stack name
-					spaceliftStackName, spaceliftStackNamePattern := buildSpaceliftStackName(spaceliftSettings, context, contextPrefix)
+					spaceliftStackName, spaceliftStackNamePattern, err := e.BuildSpaceliftStackName(spaceliftSettings, context, contextPrefix)
+					if err != nil {
+						u.LogError(err)
+						return nil, err
+					}
 
 					// Add Spacelift stack config to the final map
 					spaceliftStackNameKey := strings.Replace(spaceliftStackName, "/", "-", -1)
@@ -319,7 +397,7 @@ func TransformStackConfigToSpaceliftStacks(
 							spaceliftStackNamePattern,
 						)
 						er := errors.New(errorMessage)
-						u.PrintErrorToStdError(er)
+						u.LogError(er)
 						return nil, er
 					}
 				}
@@ -328,40 +406,4 @@ func TransformStackConfigToSpaceliftStacks(
 	}
 
 	return res, nil
-}
-
-func buildSpaceliftDependsOnStackName(
-	dependsOn string,
-	allStackNames []string,
-	currentStackName string,
-	componentNamesInCurrentStack []string,
-	currentComponentName string,
-) (string, error) {
-	var spaceliftStackName string
-
-	if u.SliceContainsString(allStackNames, dependsOn) {
-		spaceliftStackName = dependsOn
-	} else if u.SliceContainsString(componentNamesInCurrentStack, dependsOn) {
-		spaceliftStackName = fmt.Sprintf("%s-%s", currentStackName, dependsOn)
-	} else {
-		errorMessage := fmt.Errorf("component '%[1]s' in stack '%[2]s' specifies 'depends_on' dependency '%[3]s', "+
-			"but '%[3]s' is not a stack and not a terraform component in '%[2]s' stack",
-			currentComponentName,
-			currentStackName,
-			dependsOn)
-
-		return "", errorMessage
-	}
-
-	return spaceliftStackName, nil
-}
-
-// buildSpaceliftStackName build a Spacelift stack name from the provided context and state name pattern
-func buildSpaceliftStackName(spaceliftSettings map[any]any, context cfg.Context, contextPrefix string) (string, string) {
-	if spaceliftStackNamePattern, ok := spaceliftSettings["stack_name_pattern"].(string); ok {
-		return cfg.ReplaceContextTokens(context, spaceliftStackNamePattern), spaceliftStackNamePattern
-	} else {
-		defaultSpaceliftStackNamePattern := fmt.Sprintf("%s-%s", contextPrefix, context.Component)
-		return strings.Replace(defaultSpaceliftStackNamePattern, "/", "-", -1), contextPrefix
-	}
 }

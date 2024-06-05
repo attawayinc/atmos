@@ -16,13 +16,22 @@ func IsDirectory(path string) (bool, error) {
 	return fileInfo.IsDir(), err
 }
 
-// FileExists checks if a file exists and is not a directory
+// FileExists checks if the file exists and is not a directory
 func FileExists(filename string) bool {
 	fileInfo, err := os.Stat(filename)
 	if os.IsNotExist(err) || err != nil {
 		return false
 	}
 	return !fileInfo.IsDir()
+}
+
+// FileOrDirExists checks if the file or directory exists
+func FileOrDirExists(filename string) bool {
+	_, err := os.Stat(filename)
+	if err != nil {
+		return false
+	}
+	return true
 }
 
 // IsYaml checks if the file has YAML extension (does not check file schema, nor validates the file)
@@ -78,9 +87,12 @@ func JoinAbsolutePathWithPath(basePath string, providedPath string) (string, err
 	// Join the base path with the provided path
 	joinedPath := path.Join(basePath, providedPath)
 
-	// If the joined path is an absolute path, return it
+	// If the joined path is an absolute path and exists in the file system, return it
 	if filepath.IsAbs(joinedPath) {
-		return joinedPath, nil
+		_, err := os.Stat(joinedPath)
+		if err == nil {
+			return joinedPath, nil
+		}
 	}
 
 	// Convert the joined path to an absolute path
@@ -91,7 +103,7 @@ func JoinAbsolutePathWithPath(basePath string, providedPath string) (string, err
 
 	// Check if the final absolute path exists in the file system
 	_, err = os.Stat(absPath)
-	if os.IsNotExist(err) {
+	if err != nil {
 		return "", err
 	}
 
@@ -108,4 +120,45 @@ func EnsureDir(fileName string) error {
 		}
 	}
 	return nil
+}
+
+// SliceOfPathsContainsPath checks if a slice of file paths contains a path
+func SliceOfPathsContainsPath(paths []string, checkPath string) bool {
+	for _, v := range paths {
+		dir := path.Dir(v)
+		if dir == checkPath {
+			return true
+		}
+	}
+	return false
+}
+
+// GetAllFilesInDir returns all files in the provided directory and all subdirectories
+func GetAllFilesInDir(dir string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if !info.IsDir() {
+			files = append(files, strings.TrimPrefix(TrimBasePathFromPath(dir, path), "/"))
+		}
+		return nil
+	})
+	return files, err
+}
+
+// GetAllYamlFilesInDir returns all YAML files in the provided directory and all subdirectories
+func GetAllYamlFilesInDir(dir string) ([]string, error) {
+	var res []string
+
+	allFiles, err := GetAllFilesInDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, f := range allFiles {
+		if IsYaml(f) {
+			res = append(res, f)
+		}
+	}
+
+	return res, nil
 }

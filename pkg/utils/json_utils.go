@@ -1,23 +1,34 @@
 package utils
 
 import (
-	"fmt"
-	jsoniter "github.com/json-iterator/go"
+	"github.com/cloudposse/atmos/pkg/schema"
 	"os"
 	"strings"
+
+	jsoniter "github.com/json-iterator/go"
 )
 
-// PrintAsJSON prints the provided value as YAML document to the console
+// PrintAsJSON prints the provided value as JSON document to the console
 func PrintAsJSON(data any) error {
 	j, err := ConvertToJSON(data)
 	if err != nil {
 		return err
 	}
-	fmt.Println(j)
+	PrintMessage(j)
 	return nil
 }
 
-// WriteToFileAsJSON converts the provided value to YAML and writes it to the specified file
+// PrintAsJSONToFileDescriptor prints the provided value as JSON document to a file descriptor
+func PrintAsJSONToFileDescriptor(cliConfig schema.CliConfiguration, data any) error {
+	j, err := ConvertToJSON(data)
+	if err != nil {
+		return err
+	}
+	LogInfo(cliConfig, j)
+	return nil
+}
+
+// WriteToFileAsJSON converts the provided value to JSON and writes it to the specified file
 func WriteToFileAsJSON(filePath string, data any, fileMode os.FileMode) error {
 	j, err := ConvertToJSON(data)
 	if err != nil {

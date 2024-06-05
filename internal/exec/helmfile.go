@@ -4,30 +4,59 @@ package exec
 
 import (
 	"fmt"
-	"github.com/pkg/errors"
-	"github.com/spf13/cobra"
 	"os"
 	"path"
 
+	"github.com/pkg/errors"
+	"github.com/spf13/cobra"
+
+	tuiUtils "github.com/cloudposse/atmos/internal/tui/utils"
 	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
 	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
-// ExecuteHelmfile executes helmfile commands
-func ExecuteHelmfile(cmd *cobra.Command, args []string) error {
-	cliConfig, err := cfg.InitCliConfig(cfg.ConfigAndStacksInfo{}, true)
+// ExecuteHelmfileCmd parses the provided arguments and flags and executes helmfile commands
+func ExecuteHelmfileCmd(cmd *cobra.Command, args []string, additionalArgsAndFlags []string) error {
+	info, err := processCommandLineArgs("helmfile", cmd, args, additionalArgsAndFlags)
 	if err != nil {
-		u.PrintErrorToStdError(err)
 		return err
 	}
 
-	info, err := processArgsConfigAndStacks(cliConfig, "helmfile", cmd, args)
+	return ExecuteHelmfile(info)
+}
+
+// ExecuteHelmfile executes helmfile commands
+func ExecuteHelmfile(info schema.ConfigAndStacksInfo) error {
+	cliConfig, err := cfg.InitCliConfig(info, true)
 	if err != nil {
 		return err
 	}
 
 	if info.NeedHelp {
 		return nil
+	}
+
+	// If the user just types `atmos helmfile`, print Atmos logo and show helmfile help
+	if info.SubCommand == "" {
+		fmt.Println()
+		err = tuiUtils.PrintStyledText("ATMOS")
+		if err != nil {
+			return err
+		}
+
+		err = processHelp("helmfile", "")
+		if err != nil {
+			return err
+		}
+
+		fmt.Println()
+		return nil
+	}
+
+	info, err = ProcessStacks(cliConfig, info, true)
+	if err != nil {
+		return err
 	}
 
 	if len(info.Stack) < 1 {
@@ -57,14 +86,17 @@ func ExecuteHelmfile(cmd *cobra.Command, args []string) error {
 	}
 
 	// Print component variables
-	u.PrintInfo(fmt.Sprintf("\nVariables for the component '%s' in the stack '%s':\n", info.ComponentFromArg, info.Stack))
-	err = u.PrintAsYAML(info.ComponentVarsSection)
-	if err != nil {
-		return err
+	u.LogDebug(cliConfig, fmt.Sprintf("\nVariables for the component '%s' in the stack '%s':", info.ComponentFromArg, info.Stack))
+
+	if cliConfig.Logs.Level == u.LogLevelTrace || cliConfig.Logs.Level == u.LogLevelDebug {
+		err = u.PrintAsYAMLToFileDescriptor(cliConfig, info.ComponentVarsSection)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Check if component 'settings.validation' section is specified and validate the component
-	valid, err := ValidateComponent(cliConfig, info.ComponentFromArg, info.ComponentSection, "", "")
+	valid, err := ValidateComponent(cliConfig, info.ComponentFromArg, info.ComponentSection, "", "", nil, 0)
 	if err != nil {
 		return err
 	}
@@ -76,8 +108,8 @@ func ExecuteHelmfile(cmd *cobra.Command, args []string) error {
 	varFile := constructHelmfileComponentVarfileName(info)
 	varFilePath := constructHelmfileComponentVarfilePath(cliConfig, info)
 
-	u.PrintInfo("Writing the variables to file:")
-	fmt.Println(varFilePath)
+	u.LogDebug(cliConfig, "Writing the variables to file:")
+	u.LogDebug(cliConfig, varFilePath)
 
 	if !info.DryRun {
 		err = u.WriteToFileAsYAML(varFilePath, info.ComponentVarsSection, 0644)
@@ -93,60 +125,73 @@ func ExecuteHelmfile(cmd *cobra.Command, args []string) error {
 
 	context := cfg.GetContextFromVars(info.ComponentVarsSection)
 
-	// Prepare AWS profile
-	helmAwsProfile := cfg.ReplaceContextTokens(context, cliConfig.Components.Helmfile.HelmAwsProfilePattern)
-	u.PrintInfo(fmt.Sprintf("\nUsing AWS_PROFILE=%s\n\n", helmAwsProfile))
+	envVarsEKS := []string{}
 
-	// Download kubeconfig by running `aws eks update-kubeconfig`
-	kubeconfigPath := fmt.Sprintf("%s/%s-kubecfg", cliConfig.Components.Helmfile.KubeconfigPath, info.ContextPrefix)
-	clusterName := cfg.ReplaceContextTokens(context, cliConfig.Components.Helmfile.ClusterNamePattern)
-	u.PrintInfo(fmt.Sprintf("Downloading kubeconfig from the cluster '%s' and saving it to %s\n\n", clusterName, kubeconfigPath))
+	if cliConfig.Components.Helmfile.UseEKS {
+		// Prepare AWS profile
+		helmAwsProfile := cfg.ReplaceContextTokens(context, cliConfig.Components.Helmfile.HelmAwsProfilePattern)
+		u.LogDebug(cliConfig, fmt.Sprintf("\nUsing AWS_PROFILE=%s\n\n", helmAwsProfile))
 
-	err = ExecuteShellCommand("aws",
-		[]string{
-			"--profile",
-			helmAwsProfile,
-			"eks",
-			"update-kubeconfig",
-			fmt.Sprintf("--name=%s", clusterName),
-			fmt.Sprintf("--region=%s", context.Region),
-			fmt.Sprintf("--kubeconfig=%s", kubeconfigPath),
-		},
-		componentPath,
-		nil,
-		info.DryRun,
-	)
-	if err != nil {
-		return err
+		// Download kubeconfig by running `aws eks update-kubeconfig`
+		kubeconfigPath := fmt.Sprintf("%s/%s-kubecfg", cliConfig.Components.Helmfile.KubeconfigPath, info.ContextPrefix)
+		clusterName := cfg.ReplaceContextTokens(context, cliConfig.Components.Helmfile.ClusterNamePattern)
+		u.LogDebug(cliConfig, fmt.Sprintf("Downloading kubeconfig from the cluster '%s' and saving it to %s\n\n", clusterName, kubeconfigPath))
+
+		err = ExecuteShellCommand(
+			cliConfig,
+			"aws",
+			[]string{
+				"--profile",
+				helmAwsProfile,
+				"eks",
+				"update-kubeconfig",
+				fmt.Sprintf("--name=%s", clusterName),
+				fmt.Sprintf("--region=%s", context.Region),
+				fmt.Sprintf("--kubeconfig=%s", kubeconfigPath),
+			},
+			componentPath,
+			nil,
+			info.DryRun,
+			info.RedirectStdErr,
+		)
+		if err != nil {
+			return err
+		}
+
+		envVarsEKS = append(envVarsEKS, []string{
+			fmt.Sprintf("AWS_PROFILE=%s", helmAwsProfile),
+			fmt.Sprintf("KUBECONFIG=%s", kubeconfigPath),
+		}...)
 	}
 
 	// Print command info
-	u.PrintInfo("\nCommand info:")
-	fmt.Println("Helmfile binary: " + info.Command)
-	fmt.Println("Helmfile command: " + info.SubCommand)
+	u.LogDebug(cliConfig, "\nCommand info:")
+	u.LogDebug(cliConfig, "Helmfile binary: "+info.Command)
+	u.LogDebug(cliConfig, "Helmfile command: "+info.SubCommand)
 
 	// https://github.com/roboll/helmfile#cli-reference
 	// atmos helmfile diff echo-server -s tenant1-ue2-dev --global-options "--no-color --namespace=test"
 	// atmos helmfile diff echo-server -s tenant1-ue2-dev --global-options "--no-color --namespace test"
 	// atmos helmfile diff echo-server -s tenant1-ue2-dev --global-options="--no-color --namespace=test"
 	// atmos helmfile diff echo-server -s tenant1-ue2-dev --global-options="--no-color --namespace test"
-	fmt.Printf("Global options: %v\n", info.GlobalOptions)
+	u.LogDebug(cliConfig, fmt.Sprintf("Global options: %v", info.GlobalOptions))
 
-	fmt.Printf("Arguments and flags: %v\n", info.AdditionalArgsAndFlags)
-	fmt.Println("Component: " + info.ComponentFromArg)
+	u.LogDebug(cliConfig, fmt.Sprintf("Arguments and flags: %v", info.AdditionalArgsAndFlags))
+	u.LogDebug(cliConfig, "Component: "+info.ComponentFromArg)
+
 	if len(info.BaseComponent) > 0 {
-		fmt.Println("Helmfile component: " + info.BaseComponent)
+		u.LogDebug(cliConfig, "Helmfile component: "+info.BaseComponent)
 	}
 
 	if info.Stack == info.StackFromArg {
-		fmt.Println("Stack: " + info.StackFromArg)
+		u.LogDebug(cliConfig, "Stack: "+info.StackFromArg)
 	} else {
-		fmt.Println("Stack: " + info.StackFromArg)
-		fmt.Println("Stack path: " + path.Join(cliConfig.BasePath, cliConfig.Stacks.BasePath, info.Stack))
+		u.LogDebug(cliConfig, "Stack: "+info.StackFromArg)
+		u.LogDebug(cliConfig, "Stack path: "+path.Join(cliConfig.BasePath, cliConfig.Stacks.BasePath, info.Stack))
 	}
 
 	workingDir := constructHelmfileComponentWorkingDir(cliConfig, info)
-	fmt.Printf("Working dir: %s\n\n", workingDir)
+	u.LogDebug(cliConfig, fmt.Sprintf("Working dir: %s\n\n", workingDir))
 
 	// Prepare arguments and flags
 	allArgsAndFlags := []string{"--state-values-file", varFile}
@@ -158,51 +203,83 @@ func ExecuteHelmfile(cmd *cobra.Command, args []string) error {
 
 	// Prepare ENV vars
 	envVars := append(info.ComponentEnvList, []string{
-		fmt.Sprintf("AWS_PROFILE=%s", helmAwsProfile),
-		fmt.Sprintf("KUBECONFIG=%s", kubeconfigPath),
-		fmt.Sprintf("NAMESPACE=%s", context.Namespace),
-		fmt.Sprintf("TENANT=%s", context.Tenant),
-		fmt.Sprintf("ENVIRONMENT=%s", context.Environment),
-		fmt.Sprintf("STAGE=%s", context.Stage),
-		fmt.Sprintf("REGION=%s", context.Region),
 		fmt.Sprintf("STACK=%s", info.Stack),
 	}...)
 
-	u.PrintInfo("Using ENV vars:")
-	for _, v := range envVars {
-		fmt.Println(v)
+	// Append the context ENV vars (first check if they are not set by the caller)
+	env := os.Getenv("NAMESPACE")
+	if env == "" {
+		envVars = append(envVars, fmt.Sprintf("NAMESPACE=%s", context.Namespace))
+	}
+	env = os.Getenv("TENANT")
+	if env == "" {
+		envVars = append(envVars, fmt.Sprintf("TENANT=%s", context.Tenant))
+	}
+	env = os.Getenv("ENVIRONMENT")
+	if env == "" {
+		envVars = append(envVars, fmt.Sprintf("ENVIRONMENT=%s", context.Environment))
+	}
+	env = os.Getenv("STAGE")
+	if env == "" {
+		envVars = append(envVars, fmt.Sprintf("STAGE=%s", context.Stage))
+	}
+	env = os.Getenv("REGION")
+	if env == "" {
+		envVars = append(envVars, fmt.Sprintf("REGION=%s", context.Region))
 	}
 
-	err = ExecuteShellCommand(info.Command, allArgsAndFlags, componentPath, envVars, info.DryRun)
+	if cliConfig.Components.Helmfile.UseEKS {
+		envVars = append(envVars, envVarsEKS...)
+	}
+
+	u.LogTrace(cliConfig, "Using ENV vars:")
+	for _, v := range envVars {
+		u.LogTrace(cliConfig, v)
+	}
+
+	err = ExecuteShellCommand(
+		cliConfig,
+		info.Command,
+		allArgsAndFlags,
+		componentPath,
+		envVars,
+		info.DryRun,
+		info.RedirectStdErr,
+	)
 	if err != nil {
 		return err
 	}
 
 	// Cleanup
-	_ = os.Remove(varFilePath)
+	err = os.Remove(varFilePath)
+	if err != nil {
+		u.LogWarning(cliConfig, err.Error())
+	}
 
 	return nil
 }
 
-func checkHelmfileConfig(cliConfig cfg.CliConfiguration) error {
+func checkHelmfileConfig(cliConfig schema.CliConfiguration) error {
 	if len(cliConfig.Components.Helmfile.BasePath) < 1 {
 		return errors.New("Base path to helmfile components must be provided in 'components.helmfile.base_path' config or " +
 			"'ATMOS_COMPONENTS_HELMFILE_BASE_PATH' ENV variable")
 	}
 
-	if len(cliConfig.Components.Helmfile.KubeconfigPath) < 1 {
-		return errors.New("Kubeconfig path must be provided in 'components.helmfile.kubeconfig_path' config or " +
-			"'ATMOS_COMPONENTS_HELMFILE_KUBECONFIG_PATH' ENV variable")
-	}
+	if cliConfig.Components.Helmfile.UseEKS {
+		if len(cliConfig.Components.Helmfile.KubeconfigPath) < 1 {
+			return errors.New("Kubeconfig path must be provided in 'components.helmfile.kubeconfig_path' config or " +
+				"'ATMOS_COMPONENTS_HELMFILE_KUBECONFIG_PATH' ENV variable")
+		}
 
-	if len(cliConfig.Components.Helmfile.HelmAwsProfilePattern) < 1 {
-		return errors.New("Helm AWS profile pattern must be provided in 'components.helmfile.helm_aws_profile_pattern' config or " +
-			"'ATMOS_COMPONENTS_HELMFILE_HELM_AWS_PROFILE_PATTERN' ENV variable")
-	}
+		if len(cliConfig.Components.Helmfile.HelmAwsProfilePattern) < 1 {
+			return errors.New("Helm AWS profile pattern must be provided in 'components.helmfile.helm_aws_profile_pattern' config or " +
+				"'ATMOS_COMPONENTS_HELMFILE_HELM_AWS_PROFILE_PATTERN' ENV variable")
+		}
 
-	if len(cliConfig.Components.Helmfile.ClusterNamePattern) < 1 {
-		return errors.New("Cluster name pattern must be provided in 'components.helmfile.cluster_name_pattern' config or " +
-			"'ATMOS_COMPONENTS_HELMFILE_CLUSTER_NAME_PATTERN' ENV variable")
+		if len(cliConfig.Components.Helmfile.ClusterNamePattern) < 1 {
+			return errors.New("Cluster name pattern must be provided in 'components.helmfile.cluster_name_pattern' config or " +
+				"'ATMOS_COMPONENTS_HELMFILE_CLUSTER_NAME_PATTERN' ENV variable")
+		}
 	}
 
 	return nil

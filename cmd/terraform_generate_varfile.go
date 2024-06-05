@@ -1,9 +1,10 @@
 package cmd
 
 import (
+	"github.com/spf13/cobra"
+
 	e "github.com/cloudposse/atmos/internal/exec"
 	u "github.com/cloudposse/atmos/pkg/utils"
-	"github.com/spf13/cobra"
 )
 
 // terraformGenerateVarfileCmd generates varfile for a terraform component
@@ -13,9 +14,12 @@ var terraformGenerateVarfileCmd = &cobra.Command{
 	Long:               `This command generates a varfile for an atmos terraform component: atmos terraform generate varfile <component> -s <stack> -f <file>`,
 	FParseErrWhitelist: struct{ UnknownFlags bool }{UnknownFlags: false},
 	Run: func(cmd *cobra.Command, args []string) {
-		err := e.ExecuteTerraformGenerateVarfile(cmd, args)
+		// Check Atmos configuration
+		checkAtmosConfig()
+
+		err := e.ExecuteTerraformGenerateVarfileCmd(cmd, args)
 		if err != nil {
-			u.PrintErrorToStdErrorAndExit(err)
+			u.LogErrorAndExit(err)
 		}
 	},
 }
@@ -27,7 +31,7 @@ func init() {
 
 	err := terraformGenerateVarfileCmd.MarkPersistentFlagRequired("stack")
 	if err != nil {
-		u.PrintErrorToStdErrorAndExit(err)
+		u.LogErrorAndExit(err)
 	}
 
 	terraformGenerateCmd.AddCommand(terraformGenerateVarfileCmd)

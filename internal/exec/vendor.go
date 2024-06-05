@@ -1,15 +1,16 @@
 package exec
 
 import (
+	"fmt"
 	"github.com/spf13/cobra"
 )
 
-// ExecuteVendorPull executes `vendor pull` commands
-func ExecuteVendorPull(cmd *cobra.Command, args []string) error {
-	return ExecuteVendorCommand(cmd, args, "pull")
+// ExecuteVendorPullCmd executes `vendor pull` commands
+func ExecuteVendorPullCmd(cmd *cobra.Command, args []string) error {
+	return ExecuteVendorPullCommand(cmd, args)
 }
 
-// ExecuteVendorDiff executes `vendor diff` commands
-func ExecuteVendorDiff(cmd *cobra.Command, args []string) error {
-	return ExecuteVendorCommand(cmd, args, "diff")
+// ExecuteVendorDiffCmd executes `vendor diff` commands
+func ExecuteVendorDiffCmd(cmd *cobra.Command, args []string) error {
+	return fmt.Errorf("'atmos vendor diff' is not implemented yet")
 }

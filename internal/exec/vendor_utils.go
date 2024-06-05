@@ -1,30 +1,36 @@
 package exec
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"github.com/hashicorp/go-getter"
-	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v2"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
 
-	cfg "github.com/cloudposse/atmos/pkg/config"
-	u "github.com/cloudposse/atmos/pkg/utils"
+	"github.com/hashicorp/go-getter"
 	cp "github.com/otiai10/copy"
+	"github.com/samber/lo"
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v2"
+
+	cfg "github.com/cloudposse/atmos/pkg/config"
+	"github.com/cloudposse/atmos/pkg/schema"
+	u "github.com/cloudposse/atmos/pkg/utils"
 )
 
-// ExecuteVendorCommand executes `atmos vendor` commands
-func ExecuteVendorCommand(cmd *cobra.Command, args []string, vendorCommand string) error {
+// ExecuteVendorPullCommand executes `atmos vendor` commands
+func ExecuteVendorPullCommand(cmd *cobra.Command, args []string) error {
+	info, err := processCommandLineArgs("terraform", cmd, args, nil)
+	if err != nil {
+		return err
+	}
+
 	// InitCliConfig finds and merges CLI configurations in the following order:
 	// system dir, home dir, current dir, ENV vars, command-line arguments
-	cliConfig, err := cfg.InitCliConfig(cfg.ConfigAndStacksInfo{}, true)
+	cliConfig, err := cfg.InitCliConfig(info, true)
 	if err != nil {
 		return err
 	}
@@ -46,170 +52,365 @@ func ExecuteVendorCommand(cmd *cobra.Command, args []string, vendorCommand strin
 		return err
 	}
 
+	tagsCsv, err := flags.GetString("tags")
+	if err != nil {
+		return err
+	}
+
+	var tags []string
+	if tagsCsv != "" {
+		tags = strings.Split(tagsCsv, ",")
+	}
+
 	if component != "" && stack != "" {
-		return fmt.Errorf("either '--component' or '--stack' parameter needs to be provided, but not both")
+		return fmt.Errorf("either '--component' or '--stack' flag can to be provided, but not both")
 	}
 
-	if component != "" {
-		// Process component vendoring
-		componentType, err := flags.GetString("type")
-		if err != nil {
-			return err
-		}
+	if component != "" && len(tags) > 0 {
+		return fmt.Errorf("either '--component' or '--tags' flag can to be provided, but not both")
+	}
 
-		if componentType == "" {
-			componentType = "terraform"
-		}
-
-		componentConfig, componentPath, err := ReadAndProcessComponentConfigFile(cliConfig, component, componentType)
-		if err != nil {
-			return err
-		}
-
-		return ExecuteComponentVendorCommandInternal(componentConfig.Spec, component, componentPath, dryRun, vendorCommand)
-	} else {
+	if stack != "" {
 		// Process stack vendoring
-		return ExecuteStackVendorCommandInternal(stack, dryRun, vendorCommand)
+		return ExecuteStackVendorInternal(stack, dryRun)
 	}
-}
 
-// ReadAndProcessComponentConfigFile reads and processes `component.yaml` vendor config file
-func ReadAndProcessComponentConfigFile(cliConfig cfg.CliConfiguration, component string, componentType string) (cfg.VendorComponentConfig, string, error) {
-	var componentBasePath string
-	var componentConfig cfg.VendorComponentConfig
+	// Check `vendor.yaml`
+	vendorConfig, vendorConfigExists, foundVendorConfigFile, err := ReadAndProcessVendorConfigFile(cliConfig, cfg.AtmosVendorConfigFileName)
+	if vendorConfigExists && err != nil {
+		return err
+	}
 
-	if componentType == "terraform" {
-		componentBasePath = cliConfig.Components.Terraform.BasePath
-	} else if componentType == "helmfile" {
-		componentBasePath = cliConfig.Components.Helmfile.BasePath
+	if vendorConfigExists {
+		// Process `vendor.yaml`
+		return ExecuteAtmosVendorInternal(cliConfig, foundVendorConfigFile, vendorConfig.Spec, component, tags, dryRun)
 	} else {
-		return componentConfig, "", fmt.Errorf("type '%s' is not supported. Valid types are 'terraform' and 'helmfile'", componentType)
+		// Check and process `component.yaml`
+		if component != "" {
+			// Process component vendoring
+			componentType, err := flags.GetString("type")
+			if err != nil {
+				return err
+			}
+
+			if componentType == "" {
+				componentType = "terraform"
+			}
+
+			componentConfig, componentPath, err := ReadAndProcessComponentVendorConfigFile(cliConfig, component, componentType)
+			if err != nil {
+				return err
+			}
+
+			return ExecuteComponentVendorInternal(cliConfig, componentConfig.Spec, component, componentPath, dryRun)
+		}
 	}
 
-	componentPath := path.Join(cliConfig.BasePath, componentBasePath, component)
-
-	dirExists, err := u.IsDirectory(componentPath)
-	if err != nil {
-		return componentConfig, "", err
+	q := ""
+	if len(args) > 0 {
+		q = fmt.Sprintf("Did you mean 'atmos vendor pull -c %s'?", args[0])
 	}
 
-	if !dirExists {
-		return componentConfig, "", fmt.Errorf("folder '%s' does not exist", componentPath)
-	}
-
-	componentConfigFile := path.Join(componentPath, cfg.ComponentConfigFileName)
-	if !u.FileExists(componentConfigFile) {
-		return componentConfig, "", fmt.Errorf("vendor config file '%s' does not exist in the '%s' folder", cfg.ComponentConfigFileName, componentPath)
-	}
-
-	componentConfigFileContent, err := os.ReadFile(componentConfigFile)
-	if err != nil {
-		return componentConfig, "", err
-	}
-
-	if err = yaml.Unmarshal(componentConfigFileContent, &componentConfig); err != nil {
-		return componentConfig, "", err
-	}
-
-	if componentConfig.Kind != "ComponentVendorConfig" {
-		return componentConfig, "", fmt.Errorf("invalid 'kind: %s' in the vendor config file '%s'. Supported kinds: 'ComponentVendorConfig'",
-			componentConfig.Kind,
-			cfg.ComponentConfigFileName)
-	}
-
-	return componentConfig, componentPath, nil
+	return fmt.Errorf("to vendor a component, the '--component' (shorthand '-c') flag needs to be specified.\n" +
+		"Example: atmos vendor pull -c <component>\n" +
+		q)
 }
 
-// ExecuteComponentVendorCommandInternal executes a component vendor command
-// Supports all protocols (local files, Git, Mercurial, HTTP, HTTPS, Amazon S3, Google GCP),
-// URL and archive formats described in https://github.com/hashicorp/go-getter
-// https://www.allee.xyz/en/posts/getting-started-with-go-getter
-// https://github.com/otiai10/copy
-func ExecuteComponentVendorCommandInternal(
-	vendorComponentSpec cfg.VendorComponentSpec,
+// ReadAndProcessVendorConfigFile reads and processes the Atmos vendoring config file `vendor.yaml`
+func ReadAndProcessVendorConfigFile(cliConfig schema.CliConfiguration, vendorConfigFile string) (
+	schema.AtmosVendorConfig,
+	bool,
+	string,
+	error,
+) {
+	var vendorConfig schema.AtmosVendorConfig
+	vendorConfigFileExists := true
+
+	// If the vendoring manifest is specified without an extension, use the default extension
+	if filepath.Ext(vendorConfigFile) == "" {
+		vendorConfigFile = vendorConfigFile + cfg.DefaultVendoringManifestFileExtension
+	}
+
+	foundVendorConfigFile := vendorConfigFile
+
+	// Look for the vendoring manifest in the current directory
+	if !u.FileExists(vendorConfigFile) {
+		// Look for the vendoring manifest in the directory pointed to by the `base_path` setting in the `atmos.yaml`
+		pathToVendorConfig := path.Join(cliConfig.BasePath, vendorConfigFile)
+
+		if !u.FileExists(pathToVendorConfig) {
+			vendorConfigFileExists = false
+			return vendorConfig, vendorConfigFileExists, "", fmt.Errorf("vendor config file '%s' does not exist", pathToVendorConfig)
+		}
+
+		foundVendorConfigFile = pathToVendorConfig
+	}
+
+	vendorConfigFileContent, err := os.ReadFile(foundVendorConfigFile)
+	if err != nil {
+		return vendorConfig, vendorConfigFileExists, "", err
+	}
+
+	if err = yaml.Unmarshal(vendorConfigFileContent, &vendorConfig); err != nil {
+		return vendorConfig, vendorConfigFileExists, "", err
+	}
+
+	if vendorConfig.Kind != "AtmosVendorConfig" {
+		return vendorConfig, vendorConfigFileExists, "",
+			fmt.Errorf("invalid 'kind: %s' in the vendor config file '%s'. Supported kinds: 'AtmosVendorConfig'",
+				vendorConfig.Kind,
+				foundVendorConfigFile,
+			)
+	}
+
+	return vendorConfig, vendorConfigFileExists, foundVendorConfigFile, nil
+}
+
+// ExecuteAtmosVendorInternal downloads the artifacts from the sources and writes them to the targets
+func ExecuteAtmosVendorInternal(
+	cliConfig schema.CliConfiguration,
+	vendorConfigFileName string,
+	atmosVendorSpec schema.AtmosVendorSpec,
 	component string,
-	componentPath string,
+	tags []string,
 	dryRun bool,
-	vendorCommand string,
 ) error {
 
 	var tempDir string
 	var err error
-	var t *template.Template
 	var uri string
+	vendorConfigFilePath := path.Dir(vendorConfigFileName)
 
-	if vendorCommand == "pull" {
-		if vendorComponentSpec.Source.Uri == "" {
-			return errors.New("'uri' must be specified in 'source.uri' in the 'component.yaml' file")
+	u.LogInfo(cliConfig, fmt.Sprintf("Processing vendor config file '%s'", vendorConfigFileName))
+
+	if len(atmosVendorSpec.Sources) == 0 && len(atmosVendorSpec.Imports) == 0 {
+		return fmt.Errorf("either 'spec.sources' or 'spec.imports' (or both) must be defined in the vendor config file '%s'", vendorConfigFileName)
+	}
+
+	// Process imports and return all sources from all the imports and from `vendor.yaml`
+	sources, _, err := processVendorImports(
+		cliConfig,
+		vendorConfigFileName,
+		atmosVendorSpec.Imports,
+		atmosVendorSpec.Sources,
+		[]string{vendorConfigFileName},
+	)
+	if err != nil {
+		return err
+	}
+
+	if len(sources) == 0 {
+		return fmt.Errorf("'spec.sources' is empty in the vendor config file '%s' and the imports", vendorConfigFileName)
+	}
+
+	if len(tags) > 0 {
+		componentTags := lo.FlatMap(sources, func(s schema.AtmosVendorSource, index int) []string {
+			return s.Tags
+		})
+
+		if len(lo.Intersect(tags, componentTags)) == 0 {
+			return fmt.Errorf("there are no components in the vendor config file '%s' tagged with the tags %v", vendorConfigFileName, tags)
 		}
+	}
 
-		// Parse 'uri' template
-		if vendorComponentSpec.Source.Version != "" {
-			t, err = template.New(fmt.Sprintf("source-uri-%s", vendorComponentSpec.Source.Version)).Parse(vendorComponentSpec.Source.Uri)
-			if err != nil {
-				return err
-			}
-
-			var tpl bytes.Buffer
-			err = t.Execute(&tpl, vendorComponentSpec.Source)
-			if err != nil {
-				return err
-			}
-
-			uri = tpl.String()
-		} else {
-			uri = vendorComponentSpec.Source.Uri
+	components := lo.FilterMap(sources, func(s schema.AtmosVendorSource, index int) (string, bool) {
+		if s.Component != "" {
+			return s.Component, true
 		}
+		return "", false
+	})
 
-		// Check if `uri` is a file path.
-		// If it's a file path, check if it's an absolute path.
-		// If it's not absolute path, join it with the base path (component dir) and convert to absolute path.
-		if absPath, err := u.JoinAbsolutePathWithPath(componentPath, uri); err == nil {
-			uri = absPath
-		}
+	duplicateComponents := lo.FindDuplicates(components)
 
-		u.PrintInfo(fmt.Sprintf("Pulling sources for the component '%s' from '%s' and writing to '%s'\n",
+	if len(duplicateComponents) > 0 {
+		return fmt.Errorf("duplicate component names %v in the vendor config file '%s' and the imports",
+			duplicateComponents,
+			vendorConfigFileName,
+		)
+	}
+
+	if component != "" && !u.SliceContainsString(components, component) {
+		return fmt.Errorf("the flag '--component %s' is passed, but the component is not defined in any of the 'sources' in the vendor config file '%s' and the imports",
 			component,
-			uri,
-			componentPath,
-		))
+			vendorConfigFileName,
+		)
+	}
 
-		if !dryRun {
+	// Allow having duplicate targets in different sources.
+	// This can be used to vendor mixins (from local and remote sources) and write them to the same targets.
+	// TODO: consider adding a flag to `atmos vendor pull` to specify if duplicate targets are allowed or not.
+	//targets := lo.FlatMap(sources, func(s schema.AtmosVendorSource, index int) []string {
+	//	return s.Targets
+	//})
+	//
+	//duplicateTargets := lo.FindDuplicates(targets)
+	//
+	//if len(duplicateTargets) > 0 {
+	//	return fmt.Errorf("duplicate targets %v in the vendor config file '%s' and the imports",
+	//		duplicateTargets,
+	//		vendorConfigFileName,
+	//	)
+	//}
+
+	// Process sources
+	for indexSource, s := range sources {
+		// If `--component` is specified, and it's not equal to this component, skip this component
+		if component != "" && s.Component != component {
+			continue
+		}
+
+		// If `--tags` list is specified, and it does not contain any tags defined in this component, skip this component
+		// https://github.com/samber/lo?tab=readme-ov-file#intersect
+		if len(tags) > 0 && len(lo.Intersect(tags, s.Tags)) == 0 {
+			continue
+		}
+
+		if s.File == "" {
+			s.File = vendorConfigFileName
+		}
+
+		if s.Source == "" {
+			return fmt.Errorf("'source' must be specified in 'sources' in the vendor config file '%s'",
+				s.File,
+			)
+		}
+
+		if len(s.Targets) == 0 {
+			return fmt.Errorf("'targets' must be specified for the source '%s' in the vendor config file '%s'",
+				s.Source,
+				s.File,
+			)
+		}
+
+		// Parse 'source' template
+		if s.Version != "" {
+			uri, err = u.ProcessTmpl(fmt.Sprintf("source-%d-%s", indexSource, s.Version), s.Source, s, false)
+			if err != nil {
+				return err
+			}
+		} else {
+			uri = s.Source
+		}
+
+		useOciScheme := false
+		useLocalFileSystem := false
+		sourceIsLocalFile := false
+
+		// Check if `uri` uses the `oci://` scheme (to download the source from an OCI-compatible registry).
+		if strings.HasPrefix(uri, "oci://") {
+			useOciScheme = true
+			uri = strings.TrimPrefix(uri, "oci://")
+		}
+
+		if !useOciScheme {
+			if absPath, err := u.JoinAbsolutePathWithPath(vendorConfigFilePath, uri); err == nil {
+				uri = absPath
+				useLocalFileSystem = true
+
+				if u.FileExists(uri) {
+					sourceIsLocalFile = true
+				}
+			}
+		}
+
+		// Iterate over the targets
+		for indexTarget, tgt := range s.Targets {
+			var target string
+			// Parse 'target' template
+			if s.Version != "" {
+				target, err = u.ProcessTmpl(fmt.Sprintf("target-%d-%d-%s", indexSource, indexTarget, s.Version), tgt, s, false)
+				if err != nil {
+					return err
+				}
+			} else {
+				target = tgt
+			}
+
+			targetPath := path.Join(vendorConfigFilePath, target)
+
+			if s.Component != "" {
+				u.LogInfo(cliConfig, fmt.Sprintf("Pulling sources for the component '%s' from '%s' into '%s'",
+					s.Component,
+					uri,
+					targetPath,
+				))
+			} else {
+				u.LogInfo(cliConfig, fmt.Sprintf("Pulling sources from '%s' into '%s'",
+					uri,
+					targetPath,
+				))
+			}
+
+			if dryRun {
+				return nil
+			}
+
 			// Create temp folder
 			// We are using a temp folder for the following reasons:
 			// 1. 'git' does not clone into an existing folder (and we have the existing component folder with `component.yaml` in it)
 			// 2. We have the option to skip some files we don't need and include only the files we need when copying from the temp folder to the destination folder
-			// ioutil.TempDir is deprecated. As of Go 1.17, this function simply calls os.MkdirTemp
 			tempDir, err = os.MkdirTemp("", strconv.FormatInt(time.Now().Unix(), 10))
 			if err != nil {
 				return err
 			}
 
-			defer func(path string) {
-				err := os.RemoveAll(path)
+			defer removeTempDir(cliConfig, tempDir)
+
+			// Download the source into the temp directory
+			if useOciScheme {
+				// Download the Image from the OCI-compatible registry, extract the layers from the tarball, and write to the destination directory
+				err = processOciImage(cliConfig, uri, tempDir)
 				if err != nil {
-					u.PrintError(err)
+					return err
 				}
-			}(tempDir)
+			} else if useLocalFileSystem {
+				copyOptions := cp.Options{
+					PreserveTimes: false,
+					PreserveOwner: false,
+					// OnSymlink specifies what to do on symlink
+					// Override the destination file if it already exists
+					OnSymlink: func(src string) cp.SymlinkAction {
+						return cp.Deep
+					},
+				}
 
-			// Download the source into the temp folder
-			client := &getter.Client{
-				Ctx: context.Background(),
-				// Define the destination to where the files will be stored. This will create the directory if it doesn't exist
-				Dst: tempDir,
-				// Source
-				Src:  uri,
-				Mode: getter.ClientModeDir,
+				if sourceIsLocalFile {
+					tempDir = path.Join(tempDir, filepath.Base(uri))
+				}
+
+				if err = cp.Copy(uri, tempDir, copyOptions); err != nil {
+					return err
+				}
+			} else {
+				// Use `go-getter` to download the sources into the temp directory
+				// When cloning from the root of a repo w/o using modules (sub-paths), `go-getter` does the following:
+				// - If the destination directory does not exist, it creates it and runs `git init`
+				// - If the destination directory exists, it should be an already initialized Git repository (otherwise an error will be thrown)
+				// For more details, refer to
+				// - https://github.com/hashicorp/go-getter/issues/114
+				// - https://github.com/hashicorp/go-getter?tab=readme-ov-file#subdirectories
+				// We add the `uri` to the already created `tempDir` so it does not exist to allow `go-getter` to create
+				// and correctly initialize it
+				tempDir = path.Join(tempDir, filepath.Base(uri))
+
+				client := &getter.Client{
+					Ctx: context.Background(),
+					// Define the destination where the files will be stored. This will create the directory if it doesn't exist
+					Dst: tempDir,
+					// Source
+					Src:  uri,
+					Mode: getter.ClientModeAny,
+				}
+
+				if err = client.Get(); err != nil {
+					return err
+				}
 			}
 
-			if err = client.Get(); err != nil {
-				return err
-			}
-
-			// Copy from the temp folder to the destination folder with skipping of some files
+			// Copy from the temp directory to the destination folder and skip the excluded files
 			copyOptions := cp.Options{
 				// Skip specifies which files should be skipped
-				Skip: func(src string) (bool, error) {
+				Skip: func(srcInfo os.FileInfo, src, dest string) (bool, error) {
 					if strings.HasSuffix(src, ".git") {
 						return true, nil
 					}
@@ -220,33 +421,33 @@ func ExecuteComponentVendorCommandInternal(
 					// It supports POSIX-style Globs for file names/paths (double-star `**` is supported)
 					// https://en.wikipedia.org/wiki/Glob_(programming)
 					// https://github.com/bmatcuk/doublestar#patterns
-					for _, excludePath := range vendorComponentSpec.Source.ExcludedPaths {
+					for _, excludePath := range s.ExcludedPaths {
 						excludeMatch, err := u.PathMatch(excludePath, src)
 						if err != nil {
 							return true, err
 						} else if excludeMatch {
 							// If the file matches ANY of the 'excluded_paths' patterns, exclude the file
-							fmt.Printf("Excluding the file '%s' since it matches the '%s' pattern from 'excluded_paths'\n",
+							u.LogTrace(cliConfig, fmt.Sprintf("Excluding the file '%s' since it matches the '%s' pattern from 'excluded_paths'\n",
 								trimmedSrc,
 								excludePath,
-							)
+							))
 							return true, nil
 						}
 					}
 
 					// Only include the files that match the 'included_paths' patterns (if any pattern is specified)
-					if len(vendorComponentSpec.Source.IncludedPaths) > 0 {
+					if len(s.IncludedPaths) > 0 {
 						anyMatches := false
-						for _, includePath := range vendorComponentSpec.Source.IncludedPaths {
+						for _, includePath := range s.IncludedPaths {
 							includeMatch, err := u.PathMatch(includePath, src)
 							if err != nil {
 								return true, err
 							} else if includeMatch {
 								// If the file matches ANY of the 'included_paths' patterns, include the file
-								fmt.Printf("Including '%s' since it matches the '%s' pattern from 'included_paths'\n",
+								u.LogTrace(cliConfig, fmt.Sprintf("Including '%s' since it matches the '%s' pattern from 'included_paths'\n",
 									trimmedSrc,
 									includePath,
-								)
+								))
 								anyMatches = true
 								break
 							}
@@ -255,13 +456,13 @@ func ExecuteComponentVendorCommandInternal(
 						if anyMatches {
 							return false, nil
 						} else {
-							fmt.Printf("Excluding '%s' since it does not match any pattern from 'included_paths'\n", trimmedSrc)
+							u.LogTrace(cliConfig, fmt.Sprintf("Excluding '%s' since it does not match any pattern from 'included_paths'\n", trimmedSrc))
 							return true, nil
 						}
 					}
 
 					// If 'included_paths' is not provided, include all files that were not excluded
-					fmt.Printf("Including '%s'\n", u.TrimBasePathFromPath(tempDir+"/", src))
+					u.LogTrace(cliConfig, fmt.Sprintf("Including '%s'\n", u.TrimBasePathFromPath(tempDir+"/", src)))
 					return false, nil
 				},
 
@@ -271,109 +472,72 @@ func ExecuteComponentVendorCommandInternal(
 
 				// Preserve the uid and the gid of all entries
 				PreserveOwner: false,
+
+				// OnSymlink specifies what to do on symlink
+				// Override the destination file if it already exists
+				OnSymlink: func(src string) cp.SymlinkAction {
+					return cp.Deep
+				},
 			}
 
-			if err = cp.Copy(tempDir, componentPath, copyOptions); err != nil {
+			if sourceIsLocalFile {
+				if filepath.Ext(targetPath) == "" {
+					targetPath = path.Join(targetPath, filepath.Base(uri))
+				}
+			}
+
+			if err = cp.Copy(tempDir, targetPath, copyOptions); err != nil {
 				return err
 			}
 		}
-
-		// Process mixins
-		if len(vendorComponentSpec.Mixins) > 0 {
-			fmt.Println()
-
-			for _, mixin := range vendorComponentSpec.Mixins {
-				if mixin.Uri == "" {
-					return errors.New("'uri' must be specified for each 'mixin' in the 'component.yaml' file")
-				}
-
-				if mixin.Filename == "" {
-					return errors.New("'filename' must be specified for each 'mixin' in the 'component.yaml' file")
-				}
-
-				// Parse 'uri' template
-				if mixin.Version != "" {
-					t, err = template.New(fmt.Sprintf("mixin-uri-%s", mixin.Version)).Parse(mixin.Uri)
-					if err != nil {
-						return err
-					}
-
-					var tpl bytes.Buffer
-					err = t.Execute(&tpl, mixin)
-					if err != nil {
-						return err
-					}
-
-					uri = tpl.String()
-				} else {
-					uri = mixin.Uri
-				}
-
-				// Check if `uri` is a file path.
-				// If it's a file path, check if it's an absolute path.
-				// If it's not absolute path, join it with the base path (component dir) and convert to absolute path.
-				if absPath, err := u.JoinAbsolutePathWithPath(componentPath, uri); err == nil {
-					uri = absPath
-				}
-
-				u.PrintInfo(fmt.Sprintf("Pulling the mixin '%s' for the component '%s' and writing to '%s'\n",
-					uri,
-					component,
-					path.Join(componentPath, mixin.Filename),
-				))
-
-				if !dryRun {
-					err = os.RemoveAll(tempDir)
-					if err != nil {
-						return err
-					}
-
-					// Download the mixin into the temp file
-					client := &getter.Client{
-						Ctx:  context.Background(),
-						Dst:  path.Join(tempDir, mixin.Filename),
-						Src:  uri,
-						Mode: getter.ClientModeFile,
-					}
-
-					if err = client.Get(); err != nil {
-						return err
-					}
-
-					// Copy from the temp folder to the destination folder
-					copyOptions := cp.Options{
-						// Preserve the atime and the mtime of the entries
-						PreserveTimes: false,
-
-						// Preserve the uid and the gid of all entries
-						PreserveOwner: false,
-
-						// OnSymlink specifies what to do on symlink
-						// Override the destination file if it already exists
-						// Prevent the error:
-						// symlink components/terraform/mixins/context.tf components/terraform/infra/vpc-flow-logs-bucket/context.tf: file exists
-						OnSymlink: func(src string) cp.SymlinkAction {
-							return cp.Deep
-						},
-					}
-
-					if err = cp.Copy(tempDir, componentPath, copyOptions); err != nil {
-						return err
-					}
-				}
-			}
-		}
 	}
-
 	return nil
 }
 
-// ExecuteStackVendorCommandInternal executes a stack vendor command
-// TODO: implement this
-func ExecuteStackVendorCommandInternal(
-	stack string,
-	dryRun bool,
-	vendorCommand string,
-) error {
-	return fmt.Errorf("command 'atmos vendor %s --stack <stack>' is not implemented yet", vendorCommand)
+// processVendorImports processes all imports recursively and returns a list of sources
+func processVendorImports(
+	cliConfig schema.CliConfiguration,
+	vendorConfigFile string,
+	imports []string,
+	sources []schema.AtmosVendorSource,
+	allImports []string,
+) ([]schema.AtmosVendorSource, []string, error) {
+	var mergedSources []schema.AtmosVendorSource
+
+	for _, imp := range imports {
+		if u.SliceContainsString(allImports, imp) {
+			return nil, nil, fmt.Errorf("duplicate import '%s' in the vendor config file '%s'. It was already imported in the import chain",
+				imp,
+				vendorConfigFile,
+			)
+		}
+
+		allImports = append(allImports, imp)
+
+		vendorConfig, _, _, err := ReadAndProcessVendorConfigFile(cliConfig, imp)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if u.SliceContainsString(vendorConfig.Spec.Imports, imp) {
+			return nil, nil, fmt.Errorf("vendor config file '%s' imports itself in 'spec.imports'", imp)
+		}
+
+		if len(vendorConfig.Spec.Sources) == 0 && len(vendorConfig.Spec.Imports) == 0 {
+			return nil, nil, fmt.Errorf("either 'spec.sources' or 'spec.imports' (or both) must be defined in the vendor config file '%s'", imp)
+		}
+
+		mergedSources, allImports, err = processVendorImports(cliConfig, imp, vendorConfig.Spec.Imports, mergedSources, allImports)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for i, _ := range vendorConfig.Spec.Sources {
+			vendorConfig.Spec.Sources[i].File = imp
+		}
+
+		mergedSources = append(mergedSources, vendorConfig.Spec.Sources...)
+	}
+
+	return append(mergedSources, sources...), allImports, nil
 }

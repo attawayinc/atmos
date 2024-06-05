@@ -1,9 +1,10 @@
 package cmd
 
 import (
+	"github.com/spf13/cobra"
+
 	e "github.com/cloudposse/atmos/internal/exec"
 	u "github.com/cloudposse/atmos/pkg/utils"
-	"github.com/spf13/cobra"
 )
 
 // awsEksCmdUpdateKubeconfigCmd executes 'aws eks update-kubeconfig' command
@@ -11,7 +12,7 @@ var awsEksCmdUpdateKubeconfigCmd = &cobra.Command{
 	Use:   "update-kubeconfig",
 	Short: "Execute 'aws eks update-kubeconfig' command",
 
-	Long: `This command executes 'aws eks update-kubeconfig' in three different ways:
+	Long: `This command executes 'aws eks update-kubeconfig' to download 'kubeconfig' from an EKS cluster and saves it to a file. The command executes 'aws eks update-kubeconfig' in three different ways:
 
 1. If all the required parameters (cluster name and AWS profile/role) are provided on the command-line, 
 then 'atmos' executes the command without requiring the 'atmos.yaml' CLI config and context.
@@ -35,7 +36,7 @@ See https://docs.aws.amazon.com/cli/latest/reference/eks/update-kubeconfig.html 
 	Run: func(cmd *cobra.Command, args []string) {
 		err := e.ExecuteAwsEksUpdateKubeconfigCommand(cmd, args)
 		if err != nil {
-			u.PrintErrorToStdErrorAndExit(err)
+			u.LogErrorAndExit(err)
 		}
 	},
 }
